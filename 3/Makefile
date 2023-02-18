@@ -1,10 +1,7 @@
-all: actor_customers producer server
+all: main server
 
-actor_customers: actor_customers.c
-	gcc actor_customers.c -o actor_customers
-
-producer: producer.c
-	gcc producer.c -o producer
+main: main.c
+	gcc main.c -o main
 
 server: server.c
 	gcc server.c -o server
