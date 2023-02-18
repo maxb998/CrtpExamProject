@@ -5,20 +5,18 @@
 #include <string.h>
 
 #include <pthread.h>
-#include <sys/shm.h>
-#include <semaphore.h>
-#include <sys/wait.h>
+#include <time.h>
 
-//#include <sys/ipc.h>
-//#include <sys/types.h>
 
 #define MAX_THREADS 256
  
 static void * client(void * threanNum);
 static void * producer(void * fname);
+static void * actor(void * arg);
+void randomWait();
 
 // buffer and output from clients
-unsigned long *buffer, *clientOut;
+unsigned long *buffer, *clientOut, *clientMsgCount;
 // represent the current position where the next item must be written in the buffer
 size_t bufferWritePos = 0, bufferSize = 0;
 // used by the producer to stop the program when the file has ended
@@ -50,10 +48,12 @@ int main(int argc, char * argv[])
         exit(EXIT_SUCCESS);
     }
 
-    // init buffer and output array
+    // init buffer and output arrays
     buffer = (unsigned long*)malloc(bufferSize * sizeof(long));
-    clientOut = (unsigned long*)malloc(bufferSize * sizeof(long));
+    clientOut = (unsigned long*)malloc(clientCount * sizeof(long));
+    clientMsgCount = (unsigned long*)malloc(clientCount * sizeof(long));
     memset(clientOut, 0 , clientCount * sizeof(long));
+    memset(clientMsgCount, 0 , clientCount * sizeof(long));
 
     // init pthread values
     pthread_t clientThreads[MAX_THREADS], producerThread;
@@ -74,14 +74,14 @@ int main(int argc, char * argv[])
 
     // wait for termination
     pthread_join(producerThread, NULL);
-    printf("PRODUCER HAS FINISHED\n");
+    //printf("PRODUCER HAS FINISHED\n");
     for (size_t i = 0; i < clientCount; i++)
         pthread_join(clientThreads[i], NULL);
 
     unsigned long sum = 0;
     for (size_t i = 0; i < clientCount; i++)
     {
-        printf("Thread %lu returned as output %lu\n", i, clientOut[i]);
+        //printf("Thread %lu returned as output %lu\n", i, clientOut[i]);
         sum += clientOut[i];
     }
     printf("\nThe sum of all elements is %lu\n\n", sum);
@@ -119,8 +119,17 @@ static void * client(void* threadNum)
         
         pthread_cond_signal(&produceReady);
         pthread_mutex_unlock(&mutex);
+
+        // count +1 on message recived by a client
+        clientMsgCount[*(size_t*)threadNum]++;
+
+        // wait some time... plus some randomess
+        // using nanosleep, on average we want to let each thread wait around
+        randomWait();
+
     }
     client_end:
+    //printf("Thread %lu finished\n", *(size_t*)threadNum);
     return NULL;
 }
 
@@ -144,13 +153,36 @@ static void * producer(void *fname)
 
         pthread_cond_signal(&consumeReady);
         pthread_mutex_unlock(&mutex);
+
+        randomWait();
     }
     fclose(f);
 
     pthread_mutex_lock(&mutex);
     finish = true;  // reached end of file
+    pthread_cond_signal(&consumeReady);
     pthread_mutex_unlock(&mutex);
 
     return NULL;
 }
 
+static void * actor(void * arg)
+{
+    
+
+    return NULL;
+}
+
+void randomWait()
+{
+    const long millisec = 1000000L;
+    long r = random();
+    r = r*1L*millisec/RAND_MAX;
+    //printf("%lu\n", r);
+
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = r;
+
+    nanosleep(&ts, NULL);
+}
