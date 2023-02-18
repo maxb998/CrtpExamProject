@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <string.h>
 
 #include <pthread.h>
 #include <sys/shm.h>
@@ -12,202 +13,144 @@
 //#include <sys/types.h>
 
 #define MAX_THREADS 256
+ 
+static void * client(void * threanNum);
+static void * producer(void * fname);
 
+// buffer and output from clients
+unsigned long *buffer, *clientOut;
+// represent the current position where the next item must be written in the buffer
+size_t bufferWritePos = 0, bufferSize = 0;
+// used by the producer to stop the program when the file has ended
+bool finish = false;
 
-typedef struct
-{
-    sem_t mutexSem;
-    sem_t produceSem;
-    sem_t producedSem;
-    int value;
-    bool quit;
-} SharedObj;
-
-typedef struct
-{
-    pthread_t threads[MAX_THREADS];
-    pthread_cond_t mutex;
-    pthread_cond_t consumeCond;
-} ThreadManagementValues;
-
-
-
-
-int main(int argc, char * argv[]);
-
-
-// init memory sharing to communicate with producer process
-SharedObj startMemSharing();
-
-// start the producer as a process and returns its pid
-pid_t startProducer();
-
-// producer task
-void producer();
-
-// start client's threads and return a struct containing values to manage those threads
-void startClients(int n);
-
-// clients task
-void * client();
-
-// actor monitoring task, as a separate thread
-void * actor();
-
-
-char * buffer;
-size_t buffId;
-SharedObj s;
-ThreadManagementValues t;
-bool clientsQuit;
-
-
+// mutex
+pthread_mutex_t mutex;
+pthread_cond_t consumeReady, produceReady;
 
 int main(int argc, char * argv[])
 {
-    // PARSE ARGUMENTS: TODO
-    if (argc != 3)
+    // parse arguments
+    if (argc != 4)
     {
-        printf("Usage: main <BUFFER_SIZE> <CLIENTS_COUNT(THREADS)>");
+        printf("Usage: main <BUFFER_SIZE> <CLIENTS_COUNT(THREADS)> <INPUT_FILE_PATH>\n");
         exit(EXIT_SUCCESS);
     }
-    size_t bufferSize = 0, clientCount = 0;
-    sscanf("%d", argv[1], &bufferSize);
-    sscanf("%d", argv[2], &clientCount);
+    size_t clientCount = 0;
+    sscanf(argv[1], "%ld", &bufferSize);
+    sscanf(argv[2], "%ld", &clientCount);
+    if (clientCount > MAX_THREADS)
+    {
+        printf("ERROR: Cannot process more than 256 threads");
+        exit(EXIT_SUCCESS);
+    }
+    if (access(argv[3], F_OK) != 0)
+    {
+        printf("ERROR: File specified does not exists");
+        exit(EXIT_SUCCESS);
+    }
 
-    // setup buffer
-    buffer = (char*)malloc(bufferSize * sizeof(char));
+    // init buffer and output array
+    buffer = (unsigned long*)malloc(bufferSize * sizeof(long));
+    clientOut = (unsigned long*)malloc(bufferSize * sizeof(long));
+    memset(clientOut, 0 , clientCount * sizeof(long));
 
-    // setup mem sharing
-    //s = startMemSharing();
+    // init pthread values
+    pthread_t clientThreads[MAX_THREADS], producerThread;
+    pthread_mutex_init(&mutex, NULL);
+    pthread_cond_init(&consumeReady, NULL);
+    pthread_cond_init(&produceReady, NULL);
+    
+    // array needed to let each client identify itself
+    size_t * nparange = (size_t*)malloc(clientCount * sizeof(size_t));
+    for (size_t i = 0; i < clientCount; i++)
+        nparange[i] = i;
 
-    // start producer process and get its pid
-    //pid_t producerPid = startProducer(&s);
+    // start producer and clients
+    pthread_create(&producerThread, NULL, producer, (void*)argv[3]);
+    for (size_t i = 0; i < clientCount; i++)
+        pthread_create(&clientThreads[i], NULL, client, (void*)&nparange[i]);
+    
 
-    // now with the clients
-    clientsQuit = false;
-    startClients(clientCount);
+    // wait for termination
+    pthread_join(producerThread, NULL);
+    printf("PRODUCER HAS FINISHED\n");
+    for (size_t i = 0; i < clientCount; i++)
+        pthread_join(clientThreads[i], NULL);
 
-    // finally the actor monitoring task on a separate thread
-    pthread_t actorThread;
-    pthread_create(&actorThread, NULL, actor, NULL);
-
-    // wait producer to finish
-    //waitpid(producerPid, NULL, 0);
+    unsigned long sum = 0;
+    for (size_t i = 0; i < clientCount; i++)
+    {
+        printf("Thread %lu returned as output %lu\n", i, clientOut[i]);
+        sum += clientOut[i];
+    }
+    printf("\nThe sum of all elements is %lu\n\n", sum);
 
     free(buffer);
-
+    free(clientOut);
     return EXIT_SUCCESS;
 }
 
 
-
-SharedObj startMemSharing()
+static void * client(void* threadNum)
 {
-    // setup shared memory
-    int shmid = shmget(IPC_PRIVATE, sizeof(SharedObj),  SHM_R | SHM_W);
-    if (shmid == -1) // check for errors
+    while (true)
     {
-        printf("Error on shmget\n");
-        exit(EXIT_FAILURE);
-    }
+        pthread_mutex_lock(&mutex);
 
-    // points to the shared memory starting address
-    SharedObj * sl = (SharedObj*)shmat(shmid, NULL, 0666);
-    if ((!sl)) // check for errors
-    {
-        printf("Error on shmat\n");
-        exit(EXIT_FAILURE);
-    }
-
-    return *sl;
-}
-
-pid_t startProducer()
-{
-    // init mutex semaphore to avoid race condition between actor and producer process
-    sem_init(&s.mutexSem, 1, 1);
-
-    // init semaphores that regulates production rate
-    sem_init(&s.produceSem, 1, 0);
-    sem_init(&s.producedSem, 1, 1);
-    
-    // init other shared values
-    s.value = 0;
-    s.quit = false;
-
-    // fork producer process
-    pid_t producerPid = fork();
-    if (producerPid == 0)
-    {
-        producer();
-        exit(EXIT_FAILURE);    // shouldn't be necessary but if it gets here there is an error
-    }
-
-    return producerPid;
-}
-
-void producer()
-{
-    while(true)
-    {
-        sem_wait(&s.produceSem);
-        sem_wait(&s.mutexSem);
-
-        if (s.quit)
+        // check if buffer is empty
+        while (bufferWritePos == 0)
         {
-            sem_post(&s.producedSem);
-            sem_post(&s.mutexSem);
-            break;
-        }
-        else
-        {
-            s.value++;
-            sem_post(&s.producedSem);
-            sem_post(&s.mutexSem);
-        }
-    }
-    exit(0);
-}
-
-void startClients(int n)
-{  
-    // init mutex & conditions
-    pthread_mutex_init(&t.mutex, NULL);
-    pthread_cond_init(&t.consumeCond, NULL);
-
-    // start clients
-    for (int i = 0; i < n; i++)
-        pthread_create(t.threads[i], NULL, client(), NULL);
-}
-
-void * client()
-{
-    while (!clientsQuit)
-    {
-        pthread_mutex_lock(&t.mutex);
-
-        
-    }
-    
-}
-
-void * actor()
-{
-    /*while (true)
-    {
-        sem_wait(&s->producedSem);
-        sem_wait(&s->mutexSem);
-        
-        if (s->value >= 1000)
-        {
-            s->quit = true;
-            sem_post(&s->produceSem);
-            sem_post(&s->mutexSem);
-            break;
+            // if producer has read all file and buffer is empty quit
+            if (finish)
+            {
+                pthread_cond_signal(&consumeReady);
+                pthread_mutex_unlock(&mutex);
+                goto client_end;
+            }
+            pthread_cond_wait(&consumeReady, &mutex);
         }
         
-        sem_post(&s->produceSem);
-        sem_post(&s->mutexSem);
-    }*/
+        bufferWritePos--;
+        clientOut[*(size_t*)threadNum] += buffer[bufferWritePos];
+
+        // reset buffer value because it has been consumed... hehehe
+        buffer[bufferWritePos] = 0;
+        
+        pthread_cond_signal(&produceReady);
+        pthread_mutex_unlock(&mutex);
+    }
+    client_end:
+    return NULL;
 }
+
+static void * producer(void *fname)
+{
+    FILE *f;
+    unsigned long n = 0;
+
+    f = fopen((char*)fname, "r");
+    while (fscanf(f, "%lu", &n) != EOF)
+    {
+        // lock mutex
+        pthread_mutex_lock(&mutex);
+
+        // check if buffer is full
+        while (bufferWritePos >= bufferSize)
+            pthread_cond_wait(&produceReady, &mutex);
+        
+        buffer[bufferWritePos] = n;
+        bufferWritePos++;
+
+        pthread_cond_signal(&consumeReady);
+        pthread_mutex_unlock(&mutex);
+    }
+    fclose(f);
+
+    pthread_mutex_lock(&mutex);
+    finish = true;  // reached end of file
+    pthread_mutex_unlock(&mutex);
+
+    return NULL;
+}
+
