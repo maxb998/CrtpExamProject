@@ -104,6 +104,7 @@ int main(int argc, char *argv[])
     // printf("PRODUCER HAS FINISHED\n");
     for (size_t i = 0; i < clientsCount; i++)
         pthread_join(clientThreads[i], NULL);
+    pthread_join(actorThread, NULL);
 
     unsigned long sum = 0;
     for (size_t i = 0; i < clientsCount; i++)
@@ -152,7 +153,7 @@ static void *client(void *threadNum)
         // using nanosleep, on average we want to let each thread wait around
         randomWait(millisec * 4L);
     }
-client_end:
+    client_end:
     // printf("Thread %lu finished\n", *(size_t*)threadNum);
     return NULL;
 }
@@ -248,8 +249,13 @@ static void *actor(void *portPtr)
     }
 
     char response;
-    while (!finish)
+    bool finalData =true;
+    while (finalData) 
     {
+        //condition to send the final results at the end of the operation
+        if(finish)
+            finalData = false;
+
         // wait 0.5 seconds to send the next message to the server
         struct timespec ts;
         ts.tv_sec = 0;

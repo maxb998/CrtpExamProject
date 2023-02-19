@@ -13,10 +13,10 @@
 
 #define MAX_THREADS 256
 
-int main(int argc, char * argv[]);
+int main(int argc, char *argv[]);
 
-void * serverThread(void * portPtr);
-//void * displayRecievedData(void * waitTime_ms_ptr);
+void *serverThread(void *portPtr);
+void *displayRecievedData(void *arg);
 
 struct ActorData
 {
@@ -26,19 +26,19 @@ struct ActorData
     uint32_t msgConsumed[MAX_THREADS];
 };
 
-
-char stop = 0;
+bool stop = false;
 struct ActorData receivedData;
+
 pthread_mutex_t mutex;
+pthread_cond_t newDataAvailable;
 
-
-int main(int argc, char * argv[])
+int main(int argc, char *argv[])
 {
     memset(&receivedData, 0, sizeof(receivedData));
 
     // get port number as argument
     int port = 0;
-    if(argc < 2)
+    if (argc < 2)
     {
         printf("Usage: server <port>\n");
         exit(0);
@@ -46,44 +46,39 @@ int main(int argc, char * argv[])
     sscanf(argv[1], "%d", &port);
 
     pthread_mutex_init(&mutex, NULL);
+    pthread_cond_init(&newDataAvailable, NULL);
 
     // start server in another thread
     pthread_t serverT;
-    pthread_create(&serverT, NULL, serverThread, (void*)&port);
-    
+    pthread_create(&serverT, NULL, serverThread, (void *)&port);
+
+    pthread_t displayT;
+    pthread_create(&displayT, NULL, displayRecievedData, NULL);
 
     // start managing terminal output
-    printf("+==================+==========================+=======================================================\n");
-    printf("|   Queue Length   |     Produced Messages    |           Consumed Messages (per client)              \n");
-	printf("+==================+==========================+=======================================================\n");
+    printf("+--------------------+--------------------------+-------------------------------------------------------\n");
+    printf("|   Queue Length %%   |     Produced Messages    |           Consumed Messages (per client)              \n");
+    printf("+--------------------+--------------------------+-------------------------------------------------------\n");
     char command;
-    while (stop == 0)
+    while (true)
     {
         switch (getchar())
         {
-        case '\n':  // next data
-            printf("|    %10u    |        %10u        |", receivedData.msgQueueLen, receivedData.msgProduced);
-            for (size_t j = 0; j < receivedData.clientsCount; j++)
-                printf("  %10u", receivedData.msgConsumed[j]);
-            printf("\n");
-            break;
-
-        case 'c':   // reset ouput
+        case 'c': // reset ouput
             // clear console window
             system("clear");
 
             // print table header again
-            printf("+==================+==========================+=======================================================\n");
-            //              18                      26
-            printf("|   Queue Length   |     Produced Messages    |           Consumed Messages (per client)              \n");
-	        printf("+==================+==========================+=======================================================\n");
+            printf("+--------------------+--------------------------+-------------------------------------------------------\n");
+            //              20                      26
+            printf("|   Queue Length %%   |     Produced Messages    |           Consumed Messages (per client)              \n");
+            printf("+--------------------+--------------------------+-------------------------------------------------------\n");
             break;
 
-        case 'q':   // quit
-            pthread_mutex_lock(&mutex);
-            stop = 255;
-            pthread_mutex_unlock(&mutex);
+        case 'q': // quit
+            stop = true;
             pthread_join(serverT, NULL);
+            pthread_join(displayT, NULL);
             exit(EXIT_SUCCESS);
             break;
 
@@ -95,9 +90,9 @@ int main(int argc, char * argv[])
     return EXIT_SUCCESS;
 }
 
-void * serverThread(void * portPtr)
+void *serverThread(void *portPtr)
 {
-    int port = *(int*)portPtr;
+    int port = *(int *)portPtr;
 
     // create new socket
     int sd;
@@ -109,12 +104,12 @@ void * serverThread(void * portPtr)
 
     // set socket options
     int reuse = 1;
-    if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) < 0)
+    if (setsockopt(sd, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse)) < 0)
         perror("setsockopt(SO_REUSEADDR) failed");
-    #ifdef SO_REUSEPORT
-    if (setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, (const char*)&reuse, sizeof(reuse)) < 0) 
+#ifdef SO_REUSEPORT
+    if (setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, (const char *)&reuse, sizeof(reuse)) < 0)
         perror("setsockopt(SO_REUSEPORT) failed");
-    #endif
+#endif
 
     // init socket data with server informations
     struct sockaddr_in sin;
@@ -124,7 +119,7 @@ void * serverThread(void * portPtr)
     sin.sin_port = htons(port);
 
     // bind socket to specified port number
-    if (bind(sd, (struct sockaddr *) &sin, sizeof(sin)) == -1)
+    if (bind(sd, (struct sockaddr *)&sin, sizeof(sin)) == -1)
     {
         perror("bind");
         exit(1);
@@ -140,23 +135,24 @@ void * serverThread(void * portPtr)
     struct sockaddr_in actorSin;
     int sizeOfActorSin = sizeof(actorSin), actorSd;
     int totSize = 0, curSize = 0;
-    //void * receivedStream = &receivedData;
-    while (stop == 0)
+    // void * receivedStream = &receivedData;
+    while (!stop)
     {
-        printf("waiting connection\n");
+        //printf("waiting connection\n");
         // accept actor connection to server
-        if ((actorSd = accept(sd, (struct sockaddr *) &actorSin, &sizeOfActorSin)) == -1)
+        if ((actorSd = accept(sd, (struct sockaddr *)&actorSin, &sizeOfActorSin)) == -1)
         {
             perror("accept");
             exit(1);
         }
-        printf("connection established\n");
+        //printf("connection established\n");
 
         // now receive messages until end of stream
         while (true)
         {
             // recv may not be able to capture all bytes on the first go, so, even if it shouldn't happen we take precaution
-            totSize = 0; curSize = 0;
+            totSize = 0;
+            curSize = 0;
             while (totSize < sizeof(receivedData))
             {
                 curSize = recv(actorSd, &receivedData + totSize, sizeof(receivedData) - totSize, 0);
@@ -166,10 +162,18 @@ void * serverThread(void * portPtr)
             }
             if (curSize <= 0)
                 break;
-            
+
             // respond first, then process the data
-            if (send(actorSd, &stop, 1, 0) == -1)
+            char stopCmd = 0;
+            if (stop)
+                stopCmd = 255;
+            if (send(actorSd, &stopCmd, 1, 0) == -1)
                 break;
+
+            // signal other thread that new data is avaliable and it can show it
+            pthread_mutex_lock(&mutex);
+            pthread_cond_signal(&newDataAvailable);
+            pthread_mutex_unlock(&mutex);
 
             // covert from network byte order
             /*receivedData.clientsCount = ntohs(receivedData.clientsCount);
@@ -178,11 +182,38 @@ void * serverThread(void * portPtr)
             for (size_t i = 0; i < receivedData.clientsCount; i++)
                 receivedData.msgConsumed[i] = ntohl(receivedData.msgConsumed[i]);// */
         }
-        
     }
 
     close(sd);
     printf("Server is closed\n");
+
+    return NULL;
+}
+
+void *displayRecievedData(void *arg)
+{
+    char queueBar[20];
+    while (!stop)
+    {
+        // wait for new data
+        pthread_mutex_lock(&mutex);
+        pthread_cond_wait(&newDataAvailable, &mutex);
+        pthread_mutex_unlock(&mutex);
+
+        // draw new data line
+        for (size_t i = 0; i < 20; i++)
+        {
+            if (receivedData.msgQueueLen >= 5 * i)
+                queueBar[i] = '=';
+            else
+                queueBar[i] = ' ';
+        }
+
+        printf("|%s|        %10u        |", queueBar, receivedData.msgProduced);
+        for (size_t j = 0; j < receivedData.clientsCount; j++)
+            printf("  %10u", receivedData.msgConsumed[j]);
+        printf("\n");
+    }
 
     return NULL;
 }
