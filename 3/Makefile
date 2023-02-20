@@ -8,4 +8,4 @@ server: server.c
 
 
 clean: 
-	rm actor_customers producer server
+	rm main server
