@@ -22,4 +22,4 @@ $(BIN_DIR)%: $(SRC_DIR)%.c
 
 # delete all gcc output files
 clean:
-	rm -f bin/main
+	rm -f bin/main bin/server
