@@ -1,5 +1,7 @@
 {
     "files.associations": {
-        "random": "c"
+        "random": "c",
+        "stdbool.h": "c",
+        "in.h": "c"
     }
 }

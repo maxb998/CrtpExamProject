@@ -2,212 +2,300 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
+#include <string.h>
 
 #include <pthread.h>
-#include <sys/shm.h>
-#include <semaphore.h>
-#include <sys/wait.h>
+#include <time.h>
 
-//#include <sys/ipc.h>
-//#include <sys/types.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
 
 #define MAX_THREADS 256
 
+static void *client(void *threanNum);
+static void *producer(void *fname);
+static void *actor(void *portPtr);
+void randomWait(long max);
 
-typedef struct
+// buffer and output from clients
+unsigned long *buffer, *clientOut;
+// represent the current position where the next item must be written in the buffer
+size_t bufferWritePos = 0, bufferSize = 0, clientsCount = 0;
+// used by the producer to signal the clients that it won't be producing any more data
+bool finish = false;
+// millisecond in nanoseconds
+const long millisec = 1000000L;
+
+// changes to true when the server respondes to the actor with a command to stop and the producer is stopped
+// like if the file was over
+bool stopCommand = false;
+
+// values that will be sended over tcp to server
+uint32_t *clientMsgCount, producerMsgCount = 0;
+
+
+struct ActorData
 {
-    sem_t mutexSem;
-    sem_t produceSem;
-    sem_t producedSem;
-    int value;
-    bool quit;
-} SharedObj;
+    uint16_t clientsCount;
+    uint16_t msgQueueLen;
+    uint32_t msgProduced;
+    uint32_t msgConsumed[MAX_THREADS];
+};
 
-typedef struct
+
+// mutex
+pthread_mutex_t mutex;
+pthread_cond_t consumeReady, produceReady;
+
+int main(int argc, char *argv[])
 {
-    pthread_t threads[MAX_THREADS];
-    pthread_cond_t mutex;
-    pthread_cond_t consumeCond;
-} ThreadManagementValues;
-
-
-
-
-int main(int argc, char * argv[]);
-
-
-// init memory sharing to communicate with producer process
-SharedObj startMemSharing();
-
-// start the producer as a process and returns its pid
-pid_t startProducer();
-
-// producer task
-void producer();
-
-// start client's threads and return a struct containing values to manage those threads
-void startClients(int n);
-
-// clients task
-void * client();
-
-// actor monitoring task, as a separate thread
-void * actor();
-
-
-char * buffer;
-size_t buffId;
-SharedObj s;
-ThreadManagementValues t;
-bool clientsQuit;
-
-
-
-int main(int argc, char * argv[])
-{
-    // PARSE ARGUMENTS: TODO
-    if (argc != 3)
+    // parse arguments
+    if (argc != 5)
     {
-        printf("Usage: main <BUFFER_SIZE> <CLIENTS_COUNT(THREADS)>");
+        printf("Usage: main <BUFFER_SIZE> <CLIENTS_COUNT(THREADS)> <INPUT_FILE_PATH> <TCP_SOCKET_PORT>\n");
         exit(EXIT_SUCCESS);
     }
-    size_t bufferSize = 0, clientCount = 0;
-    sscanf("%d", argv[1], &bufferSize);
-    sscanf("%d", argv[2], &clientCount);
+    uint16_t port = 0;  // tcp connection port
+    sscanf(argv[1], "%ld", &bufferSize);
+    sscanf(argv[2], "%ld", &clientsCount);
+    sscanf(argv[4], "%hu", &port);
+    if (clientsCount > MAX_THREADS)
+    {
+        printf("ERROR: Cannot process more than 255 threads");
+        exit(EXIT_FAILURE);
+    }
+    if (access(argv[3], F_OK) != 0)
+    {
+        printf("ERROR: File specified does not exists");
+        exit(EXIT_FAILURE);
+    }
 
-    // setup buffer
-    buffer = (char*)malloc(bufferSize * sizeof(char));
+    // init buffer and output arrays
+    buffer = (unsigned long *)malloc(bufferSize * sizeof(long));
+    clientOut = (unsigned long *)malloc(clientsCount * sizeof(long));
+    clientMsgCount = (uint32_t *)malloc(clientsCount * sizeof(uint32_t));
+    memset(clientOut, 0, clientsCount * sizeof(long));
+    memset(clientMsgCount, 0, clientsCount * sizeof(uint32_t));
 
-    // setup mem sharing
-    //s = startMemSharing();
+    // init pthread values
+    pthread_t clientThreads[MAX_THREADS], producerThread;
+    pthread_mutex_init(&mutex, NULL);
+    pthread_cond_init(&consumeReady, NULL);
+    pthread_cond_init(&produceReady, NULL);
 
-    // start producer process and get its pid
-    //pid_t producerPid = startProducer(&s);
+    // array needed to let each client identify itself
+    size_t *nparange = (size_t *)malloc(clientsCount * sizeof(size_t));
+    for (size_t i = 0; i < clientsCount; i++)
+        nparange[i] = i;
 
-    // now with the clients
-    clientsQuit = false;
-    startClients(clientCount);
+    // start producer and clients
+    pthread_create(&producerThread, NULL, producer, (void *)argv[3]);
+    for (size_t i = 0; i < clientsCount; i++)
+        pthread_create(&clientThreads[i], NULL, client, (void *)&nparange[i]);
 
-    // finally the actor monitoring task on a separate thread
+    // start actor thread
     pthread_t actorThread;
-    pthread_create(&actorThread, NULL, actor, NULL);
+    pthread_create(&actorThread, NULL, actor, (void *)&port);
 
-    // wait producer to finish
-    //waitpid(producerPid, NULL, 0);
+    // wait for termination
+    pthread_join(producerThread, NULL);
+    // printf("PRODUCER HAS FINISHED\n");
+    for (size_t i = 0; i < clientsCount; i++)
+        pthread_join(clientThreads[i], NULL);
+    pthread_join(actorThread, NULL);
+
+    unsigned long sum = 0;
+    for (size_t i = 0; i < clientsCount; i++)
+    {
+        // printf("Thread %lu returned as output %lu\n", i, clientOut[i]);
+        sum += clientOut[i];
+    }
+    printf("\nThe sum of all elements is %lu\n\n", sum);
 
     free(buffer);
-
+    free(clientOut);
     return EXIT_SUCCESS;
 }
 
-
-
-SharedObj startMemSharing()
+static void *client(void *threadNum)
 {
-    // setup shared memory
-    int shmid = shmget(IPC_PRIVATE, sizeof(SharedObj),  SHM_R | SHM_W);
-    if (shmid == -1) // check for errors
+    while (true)
     {
-        printf("Error on shmget\n");
+        pthread_mutex_lock(&mutex);
+
+        // check if buffer is empty
+        while (bufferWritePos == 0)
+        {
+            if (finish)  // if producer has read all file and buffer is empty quit
+            {
+                pthread_cond_signal(&consumeReady);
+                pthread_mutex_unlock(&mutex);
+                goto client_end;
+            }
+            pthread_cond_wait(&consumeReady, &mutex);
+        }
+
+        bufferWritePos--;
+        clientOut[*(size_t *)threadNum] += buffer[bufferWritePos];
+
+        // reset buffer value because it has been consumed... hehehe
+        buffer[bufferWritePos] = 0;
+
+        pthread_cond_signal(&produceReady);
+        pthread_mutex_unlock(&mutex);
+
+        // count +1 on message recived by a client
+        clientMsgCount[*(size_t *)threadNum]++;
+
+        // wait some time... plus some randomess
+        // using nanosleep, on average we want to let each thread wait around
+        randomWait(millisec * 4L);
+    }
+    client_end:
+    // printf("Thread %lu finished\n", *(size_t*)threadNum);
+    return NULL;
+}
+
+static void *producer(void *fname)
+{
+    FILE *f;
+    unsigned long n = 0;
+
+    f = fopen((char *)fname, "r");
+    while ((fscanf(f, "%lu", &n) != EOF) && (!stopCommand))
+    {
+        // lock mutex
+        pthread_mutex_lock(&mutex);
+
+        // check if buffer is full
+        while (bufferWritePos >= bufferSize)
+            pthread_cond_wait(&produceReady, &mutex);
+
+        buffer[bufferWritePos] = n;
+        bufferWritePos++;
+
+        pthread_cond_signal(&consumeReady);
+        pthread_mutex_unlock(&mutex);   // exit critical region
+
+        producerMsgCount++;     // msg counter
+
+        // wait some time... plus some randomess
+        // using nanosleep, on average we want to let each thread wait around
+        randomWait(millisec);
+    }
+    fclose(f);
+
+    pthread_mutex_lock(&mutex);
+    finish = true; // signal clients that no more messages will be produced
+    pthread_cond_signal(&consumeReady);
+    pthread_mutex_unlock(&mutex);
+
+    return NULL;
+}
+
+void randomWait(long max)
+{
+    long r = random();
+    r = r * max / RAND_MAX;
+
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = r;
+
+    nanosleep(&ts, NULL);
+}
+
+static void *actor(void *portPtr)
+{
+    uint16_t port = *(uint16_t*)portPtr;
+
+    // setup message data
+    struct ActorData m;
+    //m.clientsCount = htons((uint16_t)clientsCount);
+    m.clientsCount = (uint16_t)clientsCount;
+    memset(m.msgConsumed, 0, MAX_THREADS * sizeof(uint32_t));
+    
+    // *** SETUP TCP CLIENT ***
+    const char * hostname = "localhost";
+    struct hostent *hp;
+    if ((hp = gethostbyname(hostname)) == 0)
+    {
+        perror("gethostbyname");
         exit(EXIT_FAILURE);
     }
 
-    // points to the shared memory starting address
-    SharedObj * sl = (SharedObj*)shmat(shmid, NULL, 0666);
-    if ((!sl)) // check for errors
+    // init socket data with host information
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = ((struct in_addr *)(hp->h_addr_list[0]))->s_addr;
+    sin.sin_port = htons(port);
+
+    // create new socket
+    int sd;
+    if ((sd = socket(AF_INET, SOCK_STREAM, 0)) == -1)
     {
-        printf("Error on shmat\n");
+        perror("socket");
         exit(EXIT_FAILURE);
     }
 
-    return *sl;
-}
-
-pid_t startProducer()
-{
-    // init mutex semaphore to avoid race condition between actor and producer process
-    sem_init(&s.mutexSem, 1, 1);
-
-    // init semaphores that regulates production rate
-    sem_init(&s.produceSem, 1, 0);
-    sem_init(&s.producedSem, 1, 1);
-    
-    // init other shared values
-    s.value = 0;
-    s.quit = false;
-
-    // fork producer process
-    pid_t producerPid = fork();
-    if (producerPid == 0)
+    // connnect socket to port and host
+    if (connect(sd,(struct sockaddr *)&sin, sizeof(sin)) == -1)
     {
-        producer();
-        exit(EXIT_FAILURE);    // shouldn't be necessary but if it gets here there is an error
+        perror("connect");
+        exit(EXIT_FAILURE);
     }
 
-    return producerPid;
-}
-
-void producer()
-{
-    while(true)
+    char response;
+    bool finalData =true;
+    while (finalData) 
     {
-        sem_wait(&s.produceSem);
-        sem_wait(&s.mutexSem);
+        //condition to send the final results at the end of the operation
+        if(finish)
+            finalData = false;
 
-        if (s.quit)
+        // wait 0.5 seconds to send the next message to the server
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = millisec * 500L;
+        nanosleep(&ts, NULL);
+
+        // refresh data to send and conversion
+        /*m.msgQueueLen = htons((uint16_t)(bufferWritePos*100/bufferSize));
+        m.msgProduced = htonl(producerMsgCount);
+        for (size_t i = 0; i < clientsCount; i++)
+            m.msgConsumed[i] = htonl(clientMsgCount[i]);//*/
+        m.msgQueueLen = (uint16_t)(bufferWritePos*100/bufferSize);
+        m.msgProduced = producerMsgCount;
+        for (size_t i = 0; i < clientsCount; i++)
+            m.msgConsumed[i] = clientMsgCount[i];
+
+        // send data
+        if(send(sd, &m, sizeof(m), 0) == -1)
         {
-            sem_post(&s.producedSem);
-            sem_post(&s.mutexSem);
+            perror("send");
+            exit(EXIT_FAILURE);
+        }
+
+        // recieve response, since it's a char with lenght 1 there should be no need to check if all bytes have been sent
+        // since it's either 1 which means operation is successful or 0/-1 which both mean some kind of error
+        if (recv(sd, &response, 1, 0) <= 0)
+        {
+            perror("recv");
+            exit(EXIT_FAILURE);
+        }
+
+        // check response value
+        if (response != 0)
+        {
+            stopCommand = true;
             break;
         }
-        else
-        {
-            s.value++;
-            sem_post(&s.producedSem);
-            sem_post(&s.mutexSem);
-        }
     }
-    exit(0);
-}
 
-void startClients(int n)
-{  
-    // init mutex & conditions
-    pthread_mutex_init(&t.mutex, NULL);
-    pthread_cond_init(&t.consumeCond, NULL);
+    close(sd);
 
-    // start clients
-    for (int i = 0; i < n; i++)
-        pthread_create(t.threads[i], NULL, client(), NULL);
-}
-
-void * client()
-{
-    while (!clientsQuit)
-    {
-        pthread_mutex_lock(&t.mutex);
-
-        
-    }
-    
-}
-
-void * actor()
-{
-    /*while (true)
-    {
-        sem_wait(&s->producedSem);
-        sem_wait(&s->mutexSem);
-        
-        if (s->value >= 1000)
-        {
-            s->quit = true;
-            sem_post(&s->produceSem);
-            sem_post(&s->mutexSem);
-            break;
-        }
-        
-        sem_post(&s->produceSem);
-        sem_post(&s->mutexSem);
-    }*/
+    return NULL;
 }
